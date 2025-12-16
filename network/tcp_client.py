@@ -1,20 +1,20 @@
 import socket
-from utils.constans import BUFFER_SIZE
+from network.protocol import send_json, recv_json
 
 class TCPClient:
-    def __init__(self, host, port, buffer_size=BUFFER_SIZE):
+    def __init__(self, host, port):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.connect((host, port))
-        self.buffer_size = buffer_size
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
 
-    def send_message(self, message):
-        self.sock.sendall(message.encode('utf-8'))
+    def send_data(self, payload):
+        send_json(self.sock, payload)
 
-    def recv_message(self):
-        data = self.sock.recv(self.buffer_size)
-        if not data:
-            return None
-        return data.decode('utf-8')
+    def recv_data(self):
+        return recv_json(self.sock)
 
     def close(self):
-        self.sock.close()
+        try:
+            self.sock.close()
+        except:
+            pass

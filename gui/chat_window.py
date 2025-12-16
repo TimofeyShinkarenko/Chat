@@ -1,11 +1,13 @@
 import tkinter as tk
-from tkinter import scrolledtext
+from tkinter import scrolledtext, filedialog, messagebox
 import threading
-import time
-from datetime import datetime
 import queue
+import os
+from datetime import datetime
 
 from network.tcp_client import TCPClient
+from network.protocol import send_json, recv_json, encode_file_data, \
+    decode_file_data
 
 
 class ChatWindow:
@@ -13,167 +15,232 @@ class ChatWindow:
                  incoming_connection=None):
         self.current_user = current_user
         self.target_user = target_user
-
+        self.incoming_conn = incoming_connection
         self.tcp_client = None
-        self.incoming_connection = incoming_connection
 
-        self.message_queue = queue.Queue()
+        self.msg_queue = queue.Queue()
+        self.is_alive = True
 
         self.window = tk.Toplevel(parent)
-        self.window.title(f"Чат с {target_user.username}")
-        self.window.geometry("500x400")
+        self.window.title(f"Чат с {target_user.username} (Encrypted)")
+        self.window.geometry("500x450")
 
         self.create_widgets()
 
-        if self.incoming_connection:
-            self.add_message("Система",
-                             f"Принято подключение от {target_user.username}")
-            threading.Thread(target=self.receive_messages_server,
+        if self.incoming_conn:
+            self.add_sys_msg(
+                f"Входящее подключение от {target_user.username}")
+            threading.Thread(target=self.rx_loop, args=(self.incoming_conn,),
                              daemon=True).start()
         else:
-            self.connect_to_target()
+            self.connect_init()
 
-        self.window.after(100, self.check_message_queue)
+        self.window.after(100, self.process_queue)
 
     def create_widgets(self):
-        self.chat_frame = tk.Frame(self.window)
-        self.chat_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.chat_area = scrolledtext.ScrolledText(self.window,
+                                                   state='disabled',
+                                                   wrap=tk.WORD,
+                                                   font=("Arial", 10))
+        self.chat_area.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        self.chat_text = scrolledtext.ScrolledText(
-            self.chat_frame,
-            font=("Arial", 11),
-            state=tk.DISABLED,
-            wrap=tk.WORD
-        )
-        self.chat_text.pack(fill=tk.BOTH, expand=True)
+        self.chat_area.tag_config('me', foreground='blue')
+        self.chat_area.tag_config('them', foreground='green')
+        self.chat_area.tag_config('sys', foreground='gray',
+                                  font=("Arial", 9, "italic"))
 
-        input_frame = tk.Frame(self.window)
-        input_frame.pack(fill=tk.X, padx=10, pady=10)
+        # Зона ввода
+        frame = tk.Frame(self.window)
+        frame.pack(fill=tk.X, padx=5, pady=5)
 
-        self.message_var = tk.StringVar()
-        self.message_entry = tk.Entry(
-            input_frame,
-            textvariable=self.message_var,
-            font=("Arial", 12)
-        )
-        self.message_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.message_entry.bind("<Return>", self.send_message)
-        self.message_entry.focus()
+        self.entry_var = tk.StringVar()
+        entry = tk.Entry(frame, textvariable=self.entry_var,
+                         font=("Arial", 11))
+        entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        entry.bind("<Return>", self.send_text)
 
-        self.send_button = tk.Button(
-            input_frame,
-            text="Отправить",
-            command=self.send_message,
-            font=("Arial", 10),
-            bg="lightblue"
-        )
-        self.send_button.pack(side=tk.RIGHT, padx=(5, 0))
+        btn_send = tk.Button(frame, text="Отпр.", command=self.send_text,
+                             bg="#DDDDDD")
+        btn_send.pack(side=tk.LEFT, padx=5)
 
-    def connect_to_target(self):
-        try:
-            self.tcp_client = TCPClient(self.target_user.addr,
-                                        self.target_user.port)
-            self.tcp_client.send_message(self.current_user.username)
+        btn_file = tk.Button(frame, text="📎 Файл", command=self.req_send_file,
+                             bg="#FFD700")
+        btn_file.pack(side=tk.LEFT)
 
-            self.add_message("Система", "Подключение установлено!")
-            threading.Thread(target=self.receive_messages_client,
-                             daemon=True).start()
-        except Exception as e:
-            self.add_message("Система", f"Ошибка подключения: {e}")
-            self.message_entry.config(state=tk.DISABLED)
-            self.send_button.config(state=tk.DISABLED)
+        self.status_lbl = tk.Label(self.window, text="Готов", bd=1,
+                                   relief=tk.SUNKEN, anchor=tk.W)
+        self.status_lbl.pack(side=tk.BOTTOM, fill=tk.X)
 
-    def send_message(self, event=None):
-        message = self.message_var.get().strip()
-        if not message:
-            return
-
-        try:
-            if self.tcp_client:
-                self.tcp_client.send_message(message)
-            elif self.incoming_connection:
-                self.incoming_connection.sendall(message.encode('utf-8'))
-            else:
-                self.add_message("Система", "Нет подключения.")
-                return
-
-            self.add_message("Я", message)
-            self.message_var.set("")
-        except Exception as e:
-            self.add_message("Система", f"Ошибка отправки: {e}")
-            self.disconnect()
-
-    def receive_messages_client(self):
-        while True:
+    def connect_init(self):
+        def connector():
             try:
-                if self.tcp_client:
-                    message = self.tcp_client.recv_message()
-                    self.message_queue.put(message)
-                    if not message:
-                        break
-                else:
-                    time.sleep(0.1)
+                client = TCPClient(self.target_user.addr,
+                                   self.target_user.port)
+                client.send_data({'type': 'handshake',
+                                  'username': self.current_user.username})
+
+                self.tcp_client = client
+                self.msg_queue.put(('sys', "Подключено!"))
+                threading.Thread(target=self.rx_loop, args=(client.sock,),
+                                 daemon=True).start()
             except Exception as e:
-                print(f"Ошибка приема (клиент): {e}")
-                self.message_queue.put(None)
-                break
+                self.msg_queue.put(('sys', f"Ошибка подключения: {e}"))
 
-    def receive_messages_server(self):
-        while True:
-            try:
-                data = self.incoming_connection.recv(1024)
-                if not data:
-                    self.message_queue.put(None)
-                    break
+        threading.Thread(target=connector, daemon=True).start()
 
-                message = data.decode('utf-8')
-                self.message_queue.put(message)
+    def send_text(self, event=None):
+        text = self.entry_var.get().strip()
+        if not text: return
 
-            except Exception as e:
-                print(f"Ошибка приема (сервер): {e}")
-                self.message_queue.put(None)
-                break
-        self.incoming_connection.close()
+        payload = {'type': 'msg', 'text': text}
+        if self._send_packet(payload):
+            self.add_msg("Я", text, 'me')
+            self.entry_var.set("")
 
-    def check_message_queue(self):
+    def req_send_file(self):
+        path = filedialog.askopenfilename()
+        if not path: return
+
+        size = os.path.getsize(path)
+        name = os.path.basename(path)
+
+        payload = {
+            'type': 'file_req',
+            'name': name,
+            'size': size
+        }
+        if self._send_packet(payload):
+            self.add_sys_msg(
+                f"Ожидание принятия файла: {name} ({size} байт)...")
+            self.pending_file = path
+
+    def _send_packet(self, payload):
+        conn = self.incoming_conn or (
+            self.tcp_client.sock if self.tcp_client else None)
+        if not conn:
+            self.add_sys_msg("Нет соединения")
+            return False
         try:
-            while not self.message_queue.empty():
-                message = self.message_queue.get_nowait()
+            send_json(conn, payload)
+            return True
+        except Exception as e:
+            self.add_sys_msg(f"Ошибка отправки: {e}")
+            self.close()
+            return False
 
-                if message is None:
-                    self.add_message("Система", "Соединение потеряно.")
-                    self.disconnect()
-                else:
-                    self.add_message(self.target_user.username, message)
+    def rx_loop(self, sock):
+        while self.is_alive:
+            try:
+                data = recv_json(sock)  # Используем наш secure protocol
+                if data is None: break
+                self.msg_queue.put(('protocol', data))
+            except:
+                break
+        self.msg_queue.put(('sys', "Собеседник отключился"))
+        self.disconnect()
 
-            self.window.after(100, self.check_message_queue)
-
+    def process_queue(self):
+        if not self.is_alive: return
+        try:
+            while True:
+                kind, content = self.msg_queue.get_nowait()
+                if kind == 'sys':
+                    self.add_sys_msg(content)
+                elif kind == 'protocol':
+                    self.handle_packet(content)
         except queue.Empty:
             pass
-        except Exception as e:
-            print(f"Ошибка обработки очереди: {e}")
+        self.window.after(100, self.process_queue)
 
-    def add_message(self, sender, message):
+    def handle_packet(self, pkg):
+        ptype = pkg.get('type')
+
+        if ptype == 'msg':
+            self.add_msg(self.target_user.username, pkg['text'], 'them')
+
+        elif ptype == 'file_req':
+            name = pkg['name']
+            size = pkg['size']
+            msg = f"Вам отправляют файл:\n{name}\nРазмер: {size} байт.\nПринять?"
+            if messagebox.askyesno("Входящий файл", msg, parent=self.window):
+                save_path = filedialog.asksaveasfilename(initialfile=name)
+                if save_path:
+                    self._send_packet({'type': 'file_resp', 'status': 'ok'})
+                    self.incoming_file_path = save_path
+                    self.incoming_file_size = size
+                    self.received_bytes = 0
+                    self.status_lbl.config(text=f"Прием файла: 0/{size}")
+                else:
+                    self._send_packet({'type': 'file_resp', 'status': 'no'})
+            else:
+                self._send_packet({'type': 'file_resp', 'status': 'no'})
+
+        elif ptype == 'file_resp':
+            if pkg['status'] == 'ok':
+                self.add_sys_msg("Файл принят. Начинаю отправку...")
+                threading.Thread(target=self.worker_send_file,
+                                 args=(self.pending_file,),
+                                 daemon=True).start()
+            else:
+                self.add_sys_msg("Собеседник отклонил передачу файла.")
+
+        elif ptype == 'file_chunk':
+            if hasattr(self, 'incoming_file_path'):
+                chunk = decode_file_data(pkg['data'])
+                with open(self.incoming_file_path, 'ab') as f:
+                    f.write(chunk)
+
+                self.received_bytes += len(chunk)
+                percent = int(
+                    (self.received_bytes / self.incoming_file_size) * 100)
+                self.status_lbl.config(text=f"Загрузка: {percent}%")
+
+                if self.received_bytes >= self.incoming_file_size:
+                    self.status_lbl.config(text="Файл получен!")
+                    self.add_sys_msg(
+                        f"Файл сохранен: {self.incoming_file_path}")
+                    del self.incoming_file_path
+
+    def worker_send_file(self, filepath):
         try:
-            self.chat_text.configure(state=tk.NORMAL)
-            timestamp = datetime.now().strftime("%H:%M")
-            self.chat_text.insert(tk.END,
-                                  f"[{timestamp}] {sender}: {message}\n")
-            self.chat_text.see(tk.END)
-            self.chat_text.configure(state=tk.DISABLED)
-        except tk.TclError:
-            pass
+            with open(filepath, 'rb') as f:
+                while True:
+                    chunk = f.read(
+                        4096 * 3)
+                    if not chunk: break
+
+                    b64_chunk = encode_file_data(chunk)
+                    self._send_packet(
+                        {'type': 'file_chunk', 'data': b64_chunk})
+
+            self.msg_queue.put(('sys', "Отправка файла завершена"))
+        except Exception as e:
+            self.msg_queue.put(('sys', f"Ошибка чтения/отправки файла: {e}"))
+
+    def add_msg(self, sender, text, tag):
+        self.chat_area.configure(state='normal')
+        t = datetime.now().strftime("%H:%M")
+        self.chat_area.insert(tk.END, f"[{t}] {sender}: {text}\n", tag)
+        self.chat_area.see(tk.END)
+        self.chat_area.configure(state='disabled')
+
+    def add_sys_msg(self, text):
+        self.chat_area.configure(state='normal')
+        self.chat_area.insert(tk.END, f"SYSTEM: {text}\n", 'sys')
+        self.chat_area.see(tk.END)
+        self.chat_area.configure(state='disabled')
 
     def disconnect(self):
-        self.message_entry.config(state=tk.DISABLED)
-        self.send_button.config(state=tk.DISABLED)
-        if self.tcp_client:
-            self.tcp_client.close()
-            self.tcp_client = None
-        if self.incoming_connection:
-            self.incoming_connection.close()
-            self.incoming_connection = None
+        if self.tcp_client: self.tcp_client.close()
+        if self.incoming_conn:
+            try:
+                self.incoming_conn.close()
+            except:
+                pass
+        self.tcp_client = None
+        self.incoming_conn = None
 
     def close(self):
+        self.is_alive = False
         self.disconnect()
         self.window.destroy()
